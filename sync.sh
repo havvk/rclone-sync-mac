@@ -275,10 +275,17 @@ do_sync() {
     # 详细输出
     cmd+=(--verbose)
 
-    # 代理
+    # 代理（通过命令行参数传递，环境变量作为备用）
     if [[ -n "$SOCKS5_PROXY" ]]; then
+        cmd+=(--http-proxy "$SOCKS5_PROXY")
         export ALL_PROXY="$SOCKS5_PROXY"
         export all_proxy="$SOCKS5_PROXY"
+        export HTTPS_PROXY="$SOCKS5_PROXY"
+        export https_proxy="$SOCKS5_PROXY"
+        export HTTP_PROXY="$SOCKS5_PROXY"
+        export http_proxy="$SOCKS5_PROXY"
+        export NO_PROXY="localhost,127.0.0.1,::1"
+        export no_proxy="localhost,127.0.0.1,::1"
         log "[$tag]    代理: $SOCKS5_PROXY"
     fi
 

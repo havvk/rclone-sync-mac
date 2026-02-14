@@ -1728,15 +1728,15 @@ class StatusBarController: ObservableObject {
 
     @objc private func setProxy(_ sender: NSMenuItem) {
         let alert = NSAlert()
-        alert.messageText = "设置 SOCKS5 代理"
-        alert.informativeText = "留空表示不使用代理\n格式: socks5://host:port"
+        alert.messageText = "设置代理"
+        alert.informativeText = "留空表示不使用代理\n支持 HTTP 和 SOCKS5 代理\n格式: http://host:port 或 socks5://host:port"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "确定")
         alert.addButton(withTitle: "取消")
 
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
         input.stringValue = config.socks5Proxy
-        input.placeholderString = "socks5://127.0.0.1:7890"
+        input.placeholderString = "http://127.0.0.1:7890"
         alert.accessoryView = input
 
         let response = alert.runModal()
@@ -1756,7 +1756,17 @@ class StatusBarController: ObservableObject {
                 restartAlert.addButton(withTitle: "下次生效")
                 if restartAlert.runModal() == .alertFirstButtonReturn {
                     killAllSyncs()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    // Also kill child rclone processes of any remaining tracked PIDs
+                    for pid in trackedPIDs {
+                        let pkillTask = Process()
+                        pkillTask.launchPath = "/bin/bash"
+                        pkillTask.arguments = ["-c", "pkill -P \(pid) 2>/dev/null"]
+                        try? pkillTask.run()
+                        pkillTask.waitUntilExit()
+                    }
+                    // Clear stale status/lock files for clean restart
+                    cleanupStaleStatusFiles()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                         self?.syncAllRemotes()
                     }
                 }
