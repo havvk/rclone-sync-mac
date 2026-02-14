@@ -39,3 +39,4 @@
 # ---- OneDrive nosync ----
 - *.nosync
 - **.nosync/**
+- .venv-gemini/**
