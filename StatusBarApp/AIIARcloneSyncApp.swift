@@ -59,6 +59,18 @@ struct RemoteStatus: Codable {
     }
 }
 
+/// Parsed real-time progress from rclone log output
+struct SyncProgress {
+    var percentage: String = ""      // "2%"
+    var bytesProgress: String = ""   // "139.7 MiB / 7.9 GiB"
+    var speed: String = ""           // "4.8 MiB/s"
+    var eta: String = ""             // "27m35s"
+    var filesTransferred: Int = 0    // 15
+    var filesTotal: Int = 0          // 491
+    var checksTotal: Int = 0         // 38636
+    var elapsed: String = ""         // "5m59s"
+}
+
 /// Legacy combined status (for backward compat during transition)
 struct RemoteResult: Codable {
     let remote: String
@@ -683,8 +695,10 @@ class StatusBarController: ObservableObject {
     private var syncTimers: [String: Timer] = [:]  // Per-remote scheduled timers
     private var trackedPIDs: Set<pid_t> = []         // PIDs launched by this app
     private var statusMonitorTimer: Timer?  // Status polling timer
+    private var progressTimer: Timer?       // Log parsing timer (while syncing)
     private var fileMonitor: DispatchSourceFileSystemObject?
     @Published var remoteStatuses: [String: RemoteStatus] = [:]  // Per-remote status
+    @Published var syncProgress: [String: SyncProgress] = [:]    // Per-remote progress
     @Published var nextSyncTimes: [String: Date] = [:]  // Per-remote next scheduled sync
     @Published var isPaused: Bool = false
     private let config = SyncConfig()
@@ -722,6 +736,9 @@ class StatusBarController: ObservableObject {
         logDirPath = "\(dataDirPath)/logs"
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+        // Startup: clean up stale status files from previous session
+        cleanupStaleStatusFiles()
 
         setupStatusItem()
         loadStatus()
@@ -917,7 +934,21 @@ class StatusBarController: ObservableObject {
             if let rs = remoteStatuses[name] {
                 detail = rs.message
                 switch rs.status {
-                case "syncing": icon = "🔄"; color = .systemBlue
+                case "syncing":
+                    icon = "🔄"; color = .systemBlue
+                    if let p = syncProgress[name] {
+                        var parts: [String] = []
+                        if p.filesTotal > 0 {
+                            parts.append("\(p.filesTransferred)/\(p.filesTotal) 文件")
+                        }
+                        if !p.percentage.isEmpty { parts.append(p.percentage) }
+                        if !p.speed.isEmpty { parts.append(p.speed) }
+                        if !p.eta.isEmpty { parts.append("剩余 \(p.eta)") }
+                        if !p.elapsed.isEmpty { parts.append("已用 \(p.elapsed)") }
+                        if !parts.isEmpty {
+                            detail = parts.joined(separator: " · ")
+                        }
+                    }
                 case "success":
                     icon = "✅"; color = .systemGreen
                     if let nextTime = nextSyncTimes[name] {
@@ -925,7 +956,7 @@ class StatusBarController: ObservableObject {
                     }
                 case "error":
                     icon = "❌"; color = .systemRed
-                    detail = "\(rs.message) · 已暂停自动同步"
+                    detail = "\(rs.message) · 已中断自动同步"
                 case "max_delete":
                     icon = "⚠️"; color = .systemOrange
                     detail = "\(rs.message) · 需确认"
@@ -1054,10 +1085,10 @@ class StatusBarController: ObservableObject {
         menu.addItem(NSMenuItem.separator())
 
         // Pause/Resume
-        let pauseTitle = isPaused ? "▶️ 恢复同步" : "⏸️ 暂停同步"
+        let pauseTitle = isPaused ? "▶️ 恢复同步" : "⏹️ 中断同步"
         let pause = NSMenuItem(title: pauseTitle, action: #selector(togglePause(_:)), keyEquivalent: "p")
         pause.target = self
-        pause.toolTip = isPaused ? "恢复定时自动同步" : "暂停定时自动同步，不影响手动同步"
+        pause.toolTip = isPaused ? "恢复定时自动同步" : "中断正在进行的同步并停止定时任务"
         menu.addItem(pause)
 
         menu.addItem(NSMenuItem.separator())
@@ -1224,7 +1255,7 @@ class StatusBarController: ObservableObject {
     }
 
     private func statusTitle() -> String {
-        if isPaused { return "⏸️ 同步已暂停" }
+        if isPaused { return "⏹️ 同步已中断" }
         if remoteStatuses.isEmpty { return "☁️ \(config.statusDisplayName) 同步" }
 
         let syncingRemotes = remoteStatuses.filter { $0.value.status == "syncing" }
@@ -1272,6 +1303,33 @@ class StatusBarController: ObservableObject {
 
     // MARK: - Status Loading
 
+    /// Remove status files whose sync process is no longer running
+    private func cleanupStaleStatusFiles() {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: dataDirPath) else { return }
+        for file in files where file.hasPrefix("status-") && file.hasSuffix(".json") {
+            let filePath = dataDirPath + "/" + file
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath)),
+                  let rs = try? JSONDecoder().decode(RemoteStatus.self, from: data) else { continue }
+
+            // If status is "syncing" but the process is dead, remove the stale file
+            if rs.status == "syncing" {
+                let remoteName = String(file.dropFirst(7).dropLast(5))
+                let lockFile = dataDirPath + "/sync-\(remoteName).lock"
+                var processRunning = false
+                if let pidStr = try? String(contentsOfFile: lockFile, encoding: .utf8)
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                   let pid = Int32(pidStr), pid > 0 {
+                    processRunning = (kill(pid, 0) == 0)
+                }
+                if !processRunning {
+                    try? fm.removeItem(atPath: filePath)
+                    try? fm.removeItem(atPath: lockFile)
+                }
+            }
+        }
+    }
+
     private func loadStatus() {
         // Scan for all status-{remote}.json files
         let fm = FileManager.default
@@ -1317,8 +1375,127 @@ class StatusBarController: ObservableObject {
             self.remoteStatuses = newStatuses
             let displayStatus = self.isPaused ? "paused" : self.aggregateStatus
             self.updateIcon(for: displayStatus)
+
+            // Manage progress timer: run while any remote is syncing
+            if self.isSyncing {
+                if self.progressTimer == nil {
+                    self.refreshProgress()  // Immediate first parse
+                    self.progressTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+                        self?.refreshProgress()
+                    }
+                }
+            } else {
+                self.progressTimer?.invalidate()
+                self.progressTimer = nil
+                self.syncProgress.removeAll()
+            }
+
             self.buildMenu()
         }
+    }
+
+    /// Refresh progress for all syncing remotes by parsing their log files
+    private func refreshProgress() {
+        for (remote, rs) in remoteStatuses where rs.status == "syncing" {
+            if let progress = parseLogProgress(for: remote) {
+                syncProgress[remote] = progress
+            }
+        }
+        buildMenu()
+    }
+
+    /// Parse the latest log file for a remote and extract progress info
+    private func parseLogProgress(for remote: String) -> SyncProgress? {
+        // Find the latest log file for this remote
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: logDirPath) else { return nil }
+
+        let logFiles = files
+            .filter { $0.hasPrefix("sync_") && $0.hasSuffix("_\(remote).log") }
+            .sorted()
+
+        guard let latestLog = logFiles.last else { return nil }
+        let logPath = logDirPath + "/" + latestLog
+
+        // Read the last 4KB of the log (enough for the latest progress block)
+        guard let fileHandle = FileHandle(forReadingAtPath: logPath) else { return nil }
+        defer { fileHandle.closeFile() }
+
+        let fileSize = fileHandle.seekToEndOfFile()
+        let readSize: UInt64 = min(fileSize, 4096)
+        fileHandle.seek(toFileOffset: fileSize - readSize)
+        guard let data = try? fileHandle.availableData,
+              let tail = String(data: data, encoding: .utf8) else { return nil }
+
+        let lines = tail.components(separatedBy: "\n")
+        var progress = SyncProgress()
+        var foundAny = false
+
+        // Parse from bottom up to get the latest values
+        for line in lines.reversed() {
+            // Bytes transferred: "Transferred:  139.692 MiB / 7.894 GiB, 2%, 4.799 MiB/s, ETA 27m35s"
+            if progress.percentage.isEmpty,
+               line.contains("Transferred:") && line.contains("/") && line.contains("iB") {
+                let parts = line.components(separatedBy: "Transferred:").last?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                let comps = parts.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                if comps.count >= 2 {
+                    progress.bytesProgress = comps[0]  // "139.692 MiB / 7.894 GiB"
+                    progress.percentage = comps[1]      // "2%"
+                }
+                if comps.count >= 3 { progress.speed = comps[2] }
+                if let etaPart = comps.last, etaPart.hasPrefix("ETA") {
+                    progress.eta = etaPart.replacingOccurrences(of: "ETA ", with: "")
+                }
+                foundAny = true
+            }
+            // File count: "Transferred:  15 / 491, 3%"
+            if progress.filesTotal == 0,
+               line.contains("Transferred:") && !line.contains("iB") && line.contains("/") {
+                let parts = line.components(separatedBy: "Transferred:").last?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                let numPattern = parts.components(separatedBy: ",")[0]  // "15 / 491"
+                let nums = numPattern.components(separatedBy: "/").map {
+                    $0.trimmingCharacters(in: .whitespaces)
+                }
+                if nums.count == 2 {
+                    progress.filesTransferred = Int(nums[0]) ?? 0
+                    progress.filesTotal = Int(nums[1]) ?? 0
+                }
+                foundAny = true
+            }
+            // Checks: "Checks:  38636 / 38636, 100%"
+            if progress.checksTotal == 0, line.contains("Checks:") && line.contains("/") {
+                let parts = line.components(separatedBy: "Checks:").last?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                let numPattern = parts.components(separatedBy: ",")[0]
+                let nums = numPattern.components(separatedBy: "/").map {
+                    $0.trimmingCharacters(in: .whitespaces)
+                }
+                if nums.count == 2 {
+                    progress.checksTotal = Int(nums[1]) ?? 0
+                }
+                foundAny = true
+            }
+            // Elapsed: "Elapsed time:  5m59.9s"
+            if progress.elapsed.isEmpty, line.contains("Elapsed time:") {
+                progress.elapsed = line.components(separatedBy: "Elapsed time:").last?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                // Clean up decimal seconds: "1h28m59.9s" -> "1h28m59s"
+                if let dotRange = progress.elapsed.range(of: #"\.\d+s"#, options: .regularExpression) {
+                    progress.elapsed = progress.elapsed.replacingCharacters(in: dotRange, with: "s")
+                }
+                foundAny = true
+            }
+
+            // Stop once we have all fields
+            if foundAny && !progress.percentage.isEmpty && progress.filesTotal > 0
+                && progress.checksTotal > 0 && !progress.elapsed.isEmpty {
+                break
+            }
+        }
+
+        return foundAny ? progress : nil
     }
 
     // MARK: - Actions
@@ -1497,6 +1674,18 @@ class StatusBarController: ObservableObject {
             task.arguments = ["-c", "launchctl bootout gui/\(getuid()) \(plist) 2>/dev/null"]
             try? task.run()
         } else {
+            // Clear stale status files from the interrupted session
+            cleanupStaleStatusFiles()
+            // Also clear any completed/error status files for a fresh start
+            let fm = FileManager.default
+            if let files = try? fm.contentsOfDirectory(atPath: dataDirPath) {
+                for file in files where file.hasPrefix("status-") && file.hasSuffix(".json") {
+                    try? fm.removeItem(atPath: dataDirPath + "/" + file)
+                }
+            }
+            remoteStatuses.removeAll()
+            syncProgress.removeAll()
+
             let home = FileManager.default.homeDirectoryForCurrentUser.path
             let plist = "\(home)/Library/LaunchAgents/com.rclone.sync-mac.plist"
             let task = Process()
@@ -1552,9 +1741,26 @@ class StatusBarController: ObservableObject {
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
+            let oldProxy = config.socks5Proxy
             config.socks5Proxy = input.stringValue.trimmingCharacters(in: .whitespaces)
             config.save()
             buildMenu()
+
+            // If proxy changed and syncs are running, offer to restart
+            if config.socks5Proxy != oldProxy && isSyncing {
+                let restartAlert = NSAlert()
+                restartAlert.messageText = "代理已更改"
+                restartAlert.informativeText = "当前有同步进程正在运行，新代理设置需要重启同步才能生效。\n\n是否立即重启所有同步？"
+                restartAlert.alertStyle = .informational
+                restartAlert.addButton(withTitle: "重启同步")
+                restartAlert.addButton(withTitle: "下次生效")
+                if restartAlert.runModal() == .alertFirstButtonReturn {
+                    killAllSyncs()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        self?.syncAllRemotes()
+                    }
+                }
+            }
         }
     }
 
