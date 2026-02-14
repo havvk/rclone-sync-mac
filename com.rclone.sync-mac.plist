@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rclone.sync-mac</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>exec "$HOME/OneDrive/Tools/rclone-sync-mac/sync.sh" 2>&amp;1</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/rclone-sync-mac-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/rclone-sync-mac-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/l.ylive.cn</string>
+    </dict>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

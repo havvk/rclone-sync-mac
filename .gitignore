@@ -1,0 +1,12 @@
+# Build artifacts
+StatusBarApp/build/
+
+# macOS
+.DS_Store
+._*
+
+# Runtime data (generated at runtime)
+*.lock
+*.log
+filters.txt.md5
+sync_rules.json
