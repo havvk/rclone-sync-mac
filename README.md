@@ -25,14 +25,17 @@
 ## ✨ 特性 / Features
 
 - 🔄 **双向同步** — 基于 `rclone bisync`，本地和云端双向实时同步
-- ☁️ **菜单栏常驻** — 实时显示同步状态（SF Symbols 图标），自动识别云服务名称
-- ⏰ **定时自动同步** — 通过 launchd 定时触发，可自定义间隔（5 分钟 ~ 2 小时）
+- ☁️ **多云存储** — 同时同步多个云存储（OneDrive + Google Drive + ...），独立状态跟踪
+- 📊 **实时状态** — 菜单栏常驻图标，每个云存储独立显示同步状态和下次同步倒计时
+- 📡 **分别控制** — 对单个或全部云存储执行立即同步、预览同步、清除缓存
+- 📋 **同步规则** — 为不同子目录指定同步到哪些云存储（如 Documents → OneDrive, Photos → Google Drive）
+- ⏰ **定时自动同步** — 可自定义间隔（5 分钟 ~ 2 小时），多 remote 自动交错避免并发
 - 🛡️ **安全保护** — 最大删除百分比限制，防止误删
 - ⚔️ **冲突策略可配** — 以较新/较旧/较大/本地/远程文件为准
 - 🌐 **代理支持** — SOCKS5 代理，可在 UI 中设置
+- 🔒 **进程管理** — PID 追踪、锁文件互斥、进程树清理，杜绝重复同步
 - 🔐 **一键设置** — 自动安装 rclone、交互式云存储授权
 - 🏗️ **源码分发** — 在用户机器上编译，无需签名证书
-- 🔒 **单实例保护** — 防止重复运行
 
 ## 🚀 快速开始 / Quick Start
 
@@ -76,74 +79,80 @@ cd rclone-sync-mac
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `LOCAL_PATH` | `$HOME/OneDrive` | 本地同步目录 |
-| `REMOTE` | `onedrive:` | rclone remote 名称 |
+| `REMOTES` | `onedrive:` | 要同步的 remote（空格分隔，支持多个） |
 | `SYNC_INTERVAL` | `1800` | 同步间隔（秒） |
 | `CONFLICT_RESOLVE` | `newer` | 冲突策略 |
 | `MAX_DELETE_PCT` | `50` | 最大删除文件数保护 |
 | `SOCKS5_PROXY` | *(空)* | SOCKS5 代理地址 |
 
+### 多云存储配置
+
+在 `config.env` 中设置多个 remote（空格分隔）：
+
+```bash
+REMOTES="onedrive: gdrive:"     # 同时同步 OneDrive 和 Google Drive
+LOCAL_PATH="$HOME/OneDrive"     # 所有 remote 共享同一个本地目录
+```
+
+也可以在菜单栏应用的 **☁️ 云存储** 菜单中勾选/取消勾选来启用或禁用特定 remote。
+
+### 同步规则
+
+多云存储时，可以通过菜单栏的 **📋 同步规则** 为不同子目录指定同步到哪些云存储：
+
+| 路径模式 | 同步到 |
+|---------|--------|
+| `Documents/` | 仅 OneDrive |
+| `Photos/` | 仅 Google Drive |
+| `Projects/` | OneDrive + Google Drive |
+
+未配置规则的目录默认同步到所有已启用的云存储。
+
 ### 过滤规则 `filters.txt`
 
 默认排除 `.git/`、`node_modules/`、`__pycache__/`、`.DS_Store` 等不需要同步的目录和文件。可根据需要编辑。
 
-### 切换云存储
-
-只需修改 `config.env` 中的 `REMOTE` 和 `LOCAL_PATH`：
-
-```bash
-# Google Drive
-REMOTE="gdrive:"
-LOCAL_PATH="$HOME/GoogleDrive"
-
-# Dropbox
-REMOTE="dropbox:"
-LOCAL_PATH="$HOME/Dropbox"
-
-# Nextcloud (WebDAV)
-REMOTE="webdav:"
-LOCAL_PATH="$HOME/Nextcloud"
-
-# SFTP 服务器
-REMOTE="sftp:myserver"
-LOCAL_PATH="$HOME/ServerSync"
-```
-
 ## 🛠️ 命令行使用 / CLI Usage
 
 ```bash
-./sync.sh                # 正常同步
-./sync.sh --dry-run      # 预览模式
-./sync.sh --resync       # 重新初始化基准线
-./sync.sh --force        # 忽略 max-delete 保护
+./sync.sh                         # 同步所有已配置的 remote
+./sync.sh --remote=onedrive:      # 同步指定 remote
+./sync.sh --dry-run               # 预览模式（不实际传输）
+./sync.sh --resync                # 重新初始化基准线
+./sync.sh --force                 # 忽略 max-delete 保护
+./sync.sh --remote=gdrive: --dry-run   # 组合使用
 ```
 
 ## 🏗️ 架构 / Architecture
 
 ```
 ┌──────────────────────────────────────────┐
-│         AIIA-RcloneSync.app (SwiftUI)          │
+│       AIIA-RcloneSync.app (SwiftUI)      │
 │  ┌─────────┐  ┌────────┐  ┌──────────┐  │
 │  │状态监控  │  │菜单控制 │  │设置管理   │  │
+│  │(per-     │  │(per-   │  │(config + │  │
+│  │ remote)  │  │ remote)│  │ rules)   │  │
 │  └────┬────┘  └───┬────┘  └────┬─────┘  │
 │       ▼           ▼            ▼         │
-│  status.json   sync.sh    config.env     │
+│  status-*.json  sync.sh    config.env    │
 └───────────────────┬──────────────────────┘
                     │
             ┌───────▼───────┐
             │   sync.sh     │
             │ (锁文件/日志)  │
+            │ (PID 追踪)    │
             └───────┬───────┘
-                    │
+                    │  per-remote 并发
             ┌───────▼───────┐
             │ rclone bisync │◄── filters.txt
-            └──┬─────────┬──┘
+            └──┬─────────┬──┘    sync_rules.json
                │         │
          ┌─────▼──┐  ┌───▼──────┐
-         │  本地   │  │ 云存储    │
-         │  目录   │  │ (remote) │
+         │  本地   │  │ 云存储 ×N │
+         │  目录   │  │ (remotes)│
          └────────┘  └──────────┘
 
-  ⏰ launchd → 定时触发 sync.sh
+  ⏰ 内置定时器 → 交错触发各 remote 的 sync.sh
 ```
 
 ## 📁 项目结构 / Project Structure
@@ -159,10 +168,11 @@ rclone-sync-mac/
 ├── setup.sh                         # 环境初始化（安装 rclone + 授权云存储）
 ├── install.sh                       # 一键安装
 ├── uninstall.sh                     # 卸载脚本
-├── com.rclone.sync-mac.plist   # launchd 定时任务
+├── com.rclone.sync-mac.plist        # launchd 定时任务
 └── StatusBarApp/
-    ├── AIIA-RcloneSyncApp.swift        # SwiftUI 菜单栏应用源码
-    └── AppIcon.icns                 # 应用图标
+    ├── AIIARcloneSyncApp.swift      # SwiftUI 菜单栏应用源码
+    ├── AppIcon.icns                 # 应用图标
+    └── AppIcon.png                  # 应用图标 (PNG)
 ```
 
 ## ❓ FAQ
@@ -195,6 +205,19 @@ rclone-sync-mac/
 <summary><b>支持 OneDrive 商业版 / SharePoint 吗？</b></summary>
 
 支持。在 `setup.sh` 授权时选择 OneDrive，登录商业账号即可，rclone 会自动识别驱动器类型。
+</details>
+
+<details>
+<summary><b>多云存储同步时会不会冲突？</b></summary>
+
+每个 remote 使用独立的锁文件和状态跟踪，不同 remote 的同步互不影响。定时器自动交错触发，避免同时进行大量同步。可通过同步规则进一步控制哪些目录同步到哪些云存储。
+</details>
+
+<details>
+<summary><b>清除缓存和重新初始化有什么区别？</b></summary>
+
+- **🧹 清除缓存**：仅删除 bisync 缓存文件，下次同步时自动 resync。适合日常维护。
+- **🔄 重新初始化同步**：清除缓存 + 立即执行 resync。适合首次使用或同步严重异常时。
 </details>
 
 ## 📄 License
