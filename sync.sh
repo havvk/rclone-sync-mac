@@ -369,11 +369,16 @@ do_sync() {
         log "[$tag] ❌ 同步失败 (退出码: $exit_code)"
 
         local err_msg="同步失败"
-        if echo "$output" | grep -qi "resync"; then
+        local err_status="error"
+        if echo "$output" | grep -qi "max delete"; then
+            log "[$tag] 💡 提示: 删除文件数超过安全限制 ($MAX_DELETE_PCT 个)"
+            err_msg="删除文件数超过限制 ($MAX_DELETE_PCT)"
+            err_status="max_delete"
+        elif echo "$output" | grep -qi "resync"; then
             log "[$tag] 💡 提示: 可能需要执行 --resync 修复"
             err_msg="需要 resync 修复"
         fi
-        write_status "error" "$err_msg" "$transferred" "$errors"
+        write_status "$err_status" "$err_msg" "$transferred" "$errors"
 
         notify "Cloud Sync" "❌ $tag 同步失败，请检查日志"
     fi

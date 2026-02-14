@@ -698,7 +698,7 @@ class StatusBarController: ObservableObject {
         remoteStatuses.values.contains { $0.status == "syncing" }
     }
     var hasErrors: Bool {
-        remoteStatuses.values.contains { $0.status == "error" }
+        remoteStatuses.values.contains { ["error", "max_delete"].contains($0.status) }
     }
     var aggregateStatus: String {
         if isSyncing { return "syncing" }
@@ -707,7 +707,7 @@ class StatusBarController: ObservableObject {
         return "idle"
     }
     var failedRemotes: [RemoteStatus] {
-        remoteStatuses.values.filter { $0.status == "error" }
+        remoteStatuses.values.filter { ["error", "max_delete"].contains($0.status) }
     }
 
     /// Earliest next sync time across all remotes
@@ -797,7 +797,7 @@ class StatusBarController: ObservableObject {
         // Skip if this remote is already syncing or in error state
         if let rs = remoteStatuses[remote] {
             if rs.status == "syncing" { return }
-            if rs.status == "error" { return }
+            if ["error", "max_delete"].contains(rs.status) { return }
         }
 
         // Double-check: skip if lock file exists with a running process
@@ -926,6 +926,9 @@ class StatusBarController: ObservableObject {
                 case "error":
                     icon = "❌"; color = .systemRed
                     detail = "\(rs.message) · 已暂停自动同步"
+                case "max_delete":
+                    icon = "⚠️"; color = .systemOrange
+                    detail = "\(rs.message) · 需确认"
                 default:        icon = "☁️"; color = .secondaryLabelColor
                 }
             } else {
@@ -1019,6 +1022,15 @@ class StatusBarController: ObservableObject {
                 item.target = self
                 item.representedObject = remoteName
                 retryMenu.addItem(item)
+
+                // For max_delete: offer force sync option
+                if rs.status == "max_delete" {
+                    let forceItem = NSMenuItem(title: "⚠️ 确认删除并强制同步 \(remoteName)", action: #selector(forceSyncRemote(_:)), keyEquivalent: "")
+                    forceItem.target = self
+                    forceItem.representedObject = remoteName
+                    forceItem.toolTip = "忽略删除数量限制，确认执行同步（含大量删除操作）"
+                    retryMenu.addItem(forceItem)
+                }
             }
             retryItem.submenu = retryMenu
             menu.addItem(retryItem)
@@ -1216,7 +1228,7 @@ class StatusBarController: ObservableObject {
         if remoteStatuses.isEmpty { return "☁️ \(config.statusDisplayName) 同步" }
 
         let syncingRemotes = remoteStatuses.filter { $0.value.status == "syncing" }
-        let errorRemotes = remoteStatuses.filter { $0.value.status == "error" }
+        let errorRemotes = remoteStatuses.filter { ["error", "max_delete"].contains($0.value.status) }
 
         if !syncingRemotes.isEmpty {
             let names = syncingRemotes.keys.sorted().joined(separator: ", ")
@@ -1327,6 +1339,19 @@ class StatusBarController: ObservableObject {
     @objc private func syncSingleRemote(_ sender: NSMenuItem) {
         guard let remote = sender.representedObject as? String else { return }
         runSyncForRemote(remote, extraArgs: [])
+    }
+
+    @objc private func forceSyncRemote(_ sender: NSMenuItem) {
+        guard let remote = sender.representedObject as? String else { return }
+        let alert = NSAlert()
+        alert.messageText = "⚠️ 确认强制同步 \(remote)"
+        alert.informativeText = "上次同步因删除文件数超过安全限制而中止。\n\n确认后将忽略删除数量限制执行同步，这意味着大量文件将被删除。\n\n请确认这些删除操作是你主动进行的。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "确认同步")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn {
+            runSyncForRemote(remote, extraArgs: ["--force"])
+        }
     }
 
     @objc private func resyncSingleRemote(_ sender: NSMenuItem) {
