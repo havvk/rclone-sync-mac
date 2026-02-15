@@ -302,18 +302,17 @@ do_sync() {
         # 清除 bisync 缓存，避免 invalidResourceId 等陈旧缓存问题
         local cachedir="$HOME/Library/Caches/rclone/bisync"
         if [[ -d "$cachedir" ]]; then
-            if $REPAIR; then
-                # 修复模式：只清除当前 remote 的缓存
-                local cleaned=0
-                for f in "$cachedir"/*"${tag}"*; do
-                    [[ -e "$f" ]] && rm -f "$f" && cleaned=$((cleaned+1))
-                done
-                if [[ $cleaned -gt 0 ]]; then
+            # 只清除当前 remote 的缓存文件，避免影响其他并发同步的 remote
+            local cleaned=0
+            for f in "$cachedir"/*"${tag}"*; do
+                [[ -e "$f" ]] && rm -f "$f" && cleaned=$((cleaned+1))
+            done
+            if [[ $cleaned -gt 0 ]]; then
+                if $REPAIR; then
                     log "[$tag]    🔧 已清除 $cleaned 个 $tag 缓存文件"
+                else
+                    log "[$tag]    🗑️  已清除 $cleaned 个 $tag 缓存文件"
                 fi
-            else
-                rm -rf "$cachedir"
-                log "[$tag]    🗑️  已清除全部 bisync 缓存"
             fi
         fi
     elif needs_resync; then
@@ -361,6 +360,15 @@ do_sync() {
 
     if echo "$output" | grep -q "Errors:"; then
         errors=$(echo "$output" | grep "Errors:" | head -1 | grep -oE '[0-9]+' | head -1 || echo "0")
+    fi
+
+    # 检查是否为 resync 时的无害锁文件错误
+    # rclone bisync --resync 完成后有时无法删除自己的 .lck 文件（竞争条件），
+    # 但实际同步已成功完成，此时应视为成功
+    if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "cannot remove lockfile" && \
+       echo "$output" | grep -q "100%"; then
+        log "[$tag] ⚠️  忽略无害的锁文件清理错误（同步已完成）"
+        exit_code=0
     fi
 
     # 写入结果
