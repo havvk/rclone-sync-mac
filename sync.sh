@@ -164,7 +164,7 @@ notify() {
 # ---- 检测是否需要 resync ----
 needs_resync() {
     # 检查 bisync 工作目录是否有历史文件
-    local workdir="$HOME/.cache/rclone/bisync"
+    local workdir="$HOME/Library/Caches/rclone/bisync"
     if [[ ! -d "$workdir" ]] || [[ -z "$(ls -A "$workdir" 2>/dev/null)" ]]; then
         return 0  # 需要 resync
     fi
@@ -273,6 +273,9 @@ do_sync() {
     # 弹性恢复
     cmd+=(--resilient --recover)
 
+    # 时间戳容差（避免因微小 modtime 差异导致不必要的重传）
+    cmd+=(--modify-window 1s)
+
     # 详细输出
     cmd+=(--verbose)
 
@@ -305,7 +308,9 @@ do_sync() {
             # 只清除当前 remote 的缓存文件，避免影响其他并发同步的 remote
             local cleaned=0
             for f in "$cachedir"/*"${tag}"*; do
-                [[ -e "$f" ]] && rm -f "$f" && cleaned=$((cleaned+1))
+                [[ -e "$f" ]] || continue
+                [[ "$f" == *.lck ]] && continue  # 不删除锁文件，由 rclone 自行管理
+                rm -f "$f" && cleaned=$((cleaned+1))
             done
             if [[ $cleaned -gt 0 ]]; then
                 if $REPAIR; then

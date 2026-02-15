@@ -952,7 +952,7 @@ class StatusBarController: ObservableObject {
                 case "success":
                     icon = "✅"; color = .systemGreen
                     if let nextTime = nextSyncTimes[name] {
-                        detail = "同步完成 · \(formatTimeRemaining(nextTime))"
+                        detail = "同步完成 · 下次同步 \(formatTimeRemaining(nextTime))"
                     }
                 case "error":
                     icon = "❌"; color = .systemRed
@@ -966,7 +966,7 @@ class StatusBarController: ObservableObject {
                 // No status file yet — show next sync countdown
                 icon = "⏳"; color = .secondaryLabelColor
                 if let nextTime = nextSyncTimes[name] {
-                    detail = "等待首次同步 · \(formatTimeRemaining(nextTime))"
+                    detail = "等待首次同步 · 下次同步 \(formatTimeRemaining(nextTime))"
                 } else {
                     detail = "等待同步"
                 }
@@ -1084,11 +1084,22 @@ class StatusBarController: ObservableObject {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Pause/Resume
-        let pauseTitle = isPaused ? "▶️ 恢复同步" : "⏹️ 中断同步"
+        // Pause/Resume/Abort — 三态按钮
+        let pauseTitle: String
+        let pauseTooltip: String
+        if isPaused {
+            pauseTitle = "▶️ 恢复同步"
+            pauseTooltip = "恢复定时自动同步"
+        } else if isSyncing {
+            pauseTitle = "⏹️ 中断同步"
+            pauseTooltip = "中断正在进行的同步并停止定时任务"
+        } else {
+            pauseTitle = "⏸️ 暂停同步"
+            pauseTooltip = "暂停定时同步任务"
+        }
         let pause = NSMenuItem(title: pauseTitle, action: #selector(togglePause(_:)), keyEquivalent: "p")
         pause.target = self
-        pause.toolTip = isPaused ? "恢复定时自动同步" : "中断正在进行的同步并停止定时任务"
+        pause.toolTip = pauseTooltip
         menu.addItem(pause)
 
         menu.addItem(NSMenuItem.separator())
