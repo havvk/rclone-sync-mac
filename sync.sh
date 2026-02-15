@@ -325,11 +325,16 @@ do_sync() {
         cmd+=(--resync --resync-mode newer)
     fi
 
-    # 自动清理 rclone bisync 残留锁文件
-    local lockdir="$HOME/Library/Caches/rclone/bisync"
-    if [[ -d "$lockdir" ]]; then
-        find "$lockdir" -name '*.lck' -mmin +5 -exec rm -f {} \; 2>/dev/null
-    fi
+    # rclone bisync 锁文件处理
+    # rclone 在 bisync 开始时创建 .lck，结束时删除。
+    # 重要: 只清理当前 remote 的残留锁文件！
+    # 如果用 `find -name '*.lck'` 清理所有锁文件，当 onedrive 长时间同步（数小时）时，
+    # gdrive 启动时会误删 onedrive 的 .lck，导致 onedrive 结束时报 "no such file" 错误。
+    local rclone_cachedir="$HOME/Library/Caches/rclone/bisync"
+    mkdir -p "$rclone_cachedir"
+
+    # 只清理当前 remote 的锁文件（超过 5 分钟视为残留）
+    find "$rclone_cachedir" -name "*${tag}*.lck" -mmin +5 -exec rm -f {} \; 2>/dev/null
 
     if $FORCE; then
         cmd+=(--force)
@@ -367,13 +372,55 @@ do_sync() {
         errors=$(echo "$output" | grep "Errors:" | head -1 | grep -oE '[0-9]+' | head -1 || echo "0")
     fi
 
-    # 检查是否为 resync 时的无害锁文件错误
-    # rclone bisync --resync 完成后有时无法删除自己的 .lck 文件（竞争条件），
-    # 但实际同步已成功完成，此时应视为成功
-    if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "cannot remove lockfile" && \
-       echo "$output" | grep -q "100%"; then
-        log "[$tag] ⚠️  忽略无害的锁文件清理错误（同步已完成）"
-        exit_code=0
+    # 检查是否为已完成同步后的无害错误
+    if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "100%"; then
+        # 情况1: rclone bisync 完成后无法删除自己的 .lck 文件（竞争条件）
+        # 这种错误不会损坏 bisync 状态，真正无害，直接忽略
+        if echo "$output" | grep -q "cannot remove lockfile" && \
+           ! echo "$output" | grep -q "Must run --resync"; then
+            log "[$tag] ⚠️  忽略无害的锁文件清理错误（同步已完成）"
+            exit_code=0
+        fi
+
+        # 情况2: OneDrive 409 eTag 竞争导致 bisync 状态损坏
+        # 所有文件已传输完毕，但 rclone 已将 bisync 标记为 aborted
+        # 需要自动执行 --resync 恢复 bisync 状态，否则下次正常同步会拒绝运行
+        if echo "$output" | grep -q "Must run --resync to recover"; then
+            log "[$tag] ⚠️  检测到 bisync 状态损坏（可能由 OneDrive eTag 竞争引起）"
+            log "[$tag] 🔄 自动执行 --resync 恢复 bisync 状态..."
+
+            # 构建 resync 命令（复用当前参数，去掉 verbose 减少输出）
+            local resync_cmd=("$RCLONE" "bisync" "$LOCAL_PATH" "$current_remote"
+                --resync --resync-mode newer --resilient)
+
+            # 保留过滤规则
+            if [[ -f "$FILTERS_FILE" ]]; then
+                resync_cmd+=(--filters-file "$FILTERS_FILE")
+            fi
+            if [[ -n "$dynamic_excludes" ]]; then
+                while IFS= read -r filter; do
+                    [[ -n "$filter" ]] || continue
+                    resync_cmd+=(--filter "$filter")
+                done <<< "$dynamic_excludes"
+            fi
+
+            # 保留代理
+            if [[ -n "$SOCKS5_PROXY" ]]; then
+                resync_cmd+=(--http-proxy "$SOCKS5_PROXY")
+            fi
+
+            log "[$tag] 📋 恢复命令: ${resync_cmd[*]}"
+            local resync_exit=0
+            "${resync_cmd[@]}" >> "$LOG_FILE" 2>&1 || resync_exit=$?
+
+            if [[ $resync_exit -eq 0 ]]; then
+                log "[$tag] ✅ bisync 状态已恢复，下次同步将正常运行"
+                exit_code=0
+            else
+                log "[$tag] ❌ bisync 状态恢复失败 (退出码: $resync_exit)"
+                # exit_code 保持原始错误码
+            fi
+        fi
     fi
 
     # 写入结果
