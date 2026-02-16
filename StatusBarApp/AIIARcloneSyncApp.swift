@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import ServiceManagement
 
 // MARK: - App Entry Point
 @main
@@ -34,6 +35,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusBarController = StatusBarController()
         // Hide from dock
         NSApp.setActivationPolicy(.accessory)
+
+        // Register as login item (auto-start on boot)
+        try? SMAppService.mainApp.register()
     }
 }
 
