@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="1.1.0"
+VERSION="1.2.0"
 # ==============================================================================
 # Cloud Sync - rclone 双向同步引擎
 # 使用 rclone bisync 执行双向同步
@@ -420,6 +420,46 @@ do_sync() {
                 log "[$tag] ❌ bisync 状态恢复失败 (退出码: $resync_exit)"
                 # exit_code 保持原始错误码
             fi
+        fi
+    fi
+
+    # 情况3: march 阶段遇到 "directory not found" 等可重试错误
+    # 典型场景：OneDrive 远端存在幽灵目录引用（目录元数据残留但实际不可访问）
+    # --resilient 模式会将此类错误标记为 "retryable without --resync"
+    # 自动重试一次（不用 --resync），让 bisync 利用保存的恢复状态自行恢复
+    if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "retryable without --resync"; then
+        log "[$tag] 🔄 检测到可重试错误，自动重试..."
+        log ""
+        log "[$tag] 📋 重试命令: ${cmd[*]}"
+        log ""
+
+        local retry_exit=0
+        local retry_tmpout="$(mktemp)"
+        if command -v stdbuf &>/dev/null; then
+            stdbuf -oL "${cmd[@]}" 2>&1 | tee "$retry_tmpout" | sed "s/^/[$tag] [重试] /" >> "$LOG_FILE"
+            retry_exit=${PIPESTATUS[0]}
+        else
+            "${cmd[@]}" 2>&1 | tee "$retry_tmpout" | sed "s/^/[$tag] [重试] /" >> "$LOG_FILE"
+            retry_exit=${PIPESTATUS[0]}
+        fi
+        local retry_output
+        retry_output=$(cat "$retry_tmpout")
+        rm -f "$retry_tmpout"
+
+        if [[ $retry_exit -eq 0 ]]; then
+            log "[$tag] ✅ 重试成功"
+            exit_code=0
+            output="$retry_output"
+            # 重新解析 transferred/errors
+            if echo "$output" | grep -q "Transferred:"; then
+                transferred=$(echo "$output" | grep "Transferred:" | head -1 | grep -oE '[0-9]+' | head -1 || echo "0")
+            fi
+            if echo "$output" | grep -q "Errors:"; then
+                errors=$(echo "$output" | grep "Errors:" | head -1 | grep -oE '[0-9]+' | head -1 || echo "0")
+            fi
+        else
+            log "[$tag] ❌ 重试仍然失败 (退出码: $retry_exit)"
+            exit_code=$retry_exit
         fi
     fi
 
