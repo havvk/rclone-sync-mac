@@ -7,7 +7,8 @@ VERSION="1.2.0"
 # 用法:
 #   ./sync.sh --remote=onedrive       # 同步指定 remote
 #   ./sync.sh --remote=onedrive --dry-run    # 预览模式
-#   ./sync.sh --remote=onedrive --resync     # 强制重新初始化
+#   ./sync.sh --remote=onedrive --resync     # 重建 bisync 状态（以本地为准）
+#   ./sync.sh --remote=onedrive --fresh      # 新设备首次拉取（以远端为准）
 #   ./sync.sh --remote=onedrive --repair     # 清缓存并重新初始化
 #   ./sync.sh --remote=onedrive --force      # 忽略 max-delete 保护
 # ==============================================================================
@@ -47,6 +48,7 @@ mkdir -p "$LOG_DIR"
 # ---- 参数解析 ----
 DRY_RUN=false
 RESYNC=false
+FRESH=false
 FORCE=false
 REPAIR=false
 SINGLE_REMOTE=""
@@ -55,6 +57,7 @@ for arg in "$@"; do
     case "$arg" in
         --dry-run)     DRY_RUN=true ;;
         --resync)      RESYNC=true ;;
+        --fresh)       FRESH=true; RESYNC=true ;;
         --force)       FORCE=true ;;
         --repair)      REPAIR=true; RESYNC=true ;;
         --remote=*)    SINGLE_REMOTE="${arg#--remote=}" ;;
@@ -161,11 +164,12 @@ notify() {
     osascript -e "display notification \"$message\" with title \"$title\"" 2>/dev/null || true
 }
 
-# ---- 检测是否需要 resync ----
+# ---- 同步状态文件 ----
+INIT_STATE_FILE="$DATA_DIR/.initialized-${REMOTE_TAG}"
+
 needs_resync() {
-    # 检查 bisync 工作目录是否有历史文件
-    local workdir="$HOME/Library/Caches/rclone/bisync"
-    if [[ ! -d "$workdir" ]] || [[ -z "$(ls -A "$workdir" 2>/dev/null)" ]]; then
+    # 检查是否有此 remote 的初始化记录
+    if [[ ! -f "$INIT_STATE_FILE" ]]; then
         return 0  # 需要 resync
     fi
     return 1  # 不需要
@@ -276,6 +280,9 @@ do_sync() {
     # 时间戳容差（避免因微小 modtime 差异导致不必要的重传）
     cmd+=(--modify-window 1s)
 
+    # 跳过正在写入的文件（避免因本地文件在同步期间被修改而导致整个 bisync 中止）
+    cmd+=(--local-no-check-updated)
+
     # 详细输出
     cmd+=(--verbose)
 
@@ -300,16 +307,61 @@ do_sync() {
     fi
 
     if $RESYNC; then
-        cmd+=(--resync --resync-mode newer)
-        log "[$tag]    ⚠️  执行 resync 初始化"
+        # 重置初始化状态
+        rm -f "$INIT_STATE_FILE"
+        # ---- 预同步：先用单向 sync 对齐两端，再用 bisync --resync 建立追踪状态 ----
+        # resync 会把只存在一端的文件复制到另一端，无法区分“新文件”和“已删除的文件”
+        # 因此先用单向 sync 让两端一致，这样 resync 只是建立元数据，不会移动文件
+        local pre_sync_cmd=("$RCLONE" "sync")
+
+        if $FRESH; then
+            # 新设备：远端 → 本地
+            pre_sync_cmd+=("$current_remote" "$LOCAL_PATH")
+            log "[$tag]    🆕 新设备模式 (--fresh)：先从远端拉取文件"
+        else
+            # 现有设备：本地 → 远端（传播本地删除）
+            pre_sync_cmd+=("$LOCAL_PATH" "$current_remote")
+            log "[$tag]    ⚠️  执行 resync：先将本地状态同步到远端"
+        fi
+
+        # 复用过滤规则和代理
+        if [[ -f "$FILTERS_FILE" ]]; then
+            pre_sync_cmd+=(--filter-from "$FILTERS_FILE")
+        fi
+        if [[ -n "$dynamic_excludes" ]]; then
+            while IFS= read -r filter; do
+                [[ -n "$filter" ]] || continue
+                pre_sync_cmd+=(--filter "$filter")
+            done <<< "$dynamic_excludes"
+        fi
+        if [[ -n "$SOCKS5_PROXY" ]]; then
+            pre_sync_cmd+=(--http-proxy "$SOCKS5_PROXY")
+        fi
+        pre_sync_cmd+=(--local-no-check-updated --verbose)
+
+        log "[$tag] 📦 预同步命令: ${pre_sync_cmd[*]}"
+        local pre_sync_exit=0
+        "${pre_sync_cmd[@]}" >> "$LOG_FILE" 2>&1 || pre_sync_exit=$?
+
+        if [[ $pre_sync_exit -ne 0 ]]; then
+            log "[$tag] ❌ 预同步失败 (退出码: $pre_sync_exit)，跳过 resync"
+            write_status "error" "预同步失败" 0 1
+            return $pre_sync_exit
+        fi
+        log "[$tag] ✅ 预同步完成，开始建立 bisync 追踪状态..."
+
+        cmd+=(--resync)
+
         # 清除 bisync 缓存，避免 invalidResourceId 等陈旧缓存问题
         local cachedir="$HOME/Library/Caches/rclone/bisync"
         if [[ -d "$cachedir" ]]; then
             # 只清除当前 remote 的缓存文件，避免影响其他并发同步的 remote
+            # 注意: macOS 文件系统不区分大小写，*onedrive* 会匹配到包含 OneDrive 的 gdrive 缓存
+            # 因此使用 ..${tag}_ 精确匹配远端标识部分（如 ..onedrive_）
             local cleaned=0
-            for f in "$cachedir"/*"${tag}"*; do
+            for f in "$cachedir"/*".."${tag}"_"*; do
                 [[ -e "$f" ]] || continue
-                [[ "$f" == *.lck ]] && continue  # 不删除锁文件，由 rclone 自行管理
+                [[ "$f" == *.lck ]] && continue
                 rm -f "$f" && cleaned=$((cleaned+1))
             done
             if [[ $cleaned -gt 0 ]]; then
@@ -321,8 +373,46 @@ do_sync() {
             fi
         fi
     elif needs_resync; then
-        log "[$tag]    ⚠️  首次运行，自动执行 resync"
-        cmd+=(--resync --resync-mode newer)
+        # 首次运行：自动判断是新设备还是现有设备
+        local local_file_count
+        local_file_count=$(find "$LOCAL_PATH" -mindepth 1 -maxdepth 1 -not -name '.*' | wc -l | tr -d ' ')
+
+        if [[ "$local_file_count" -gt 0 ]]; then
+            # 本地有文件 → 现有设备，先将本地状态同步到远端
+            log "[$tag]    ⚠️  首次运行（本地有 ${local_file_count} 个项目），以本地为准"
+            local pre_sync_cmd=("$RCLONE" "sync" "$LOCAL_PATH" "$current_remote")
+        else
+            # 本地为空 → 新设备，先从远端拉取
+            log "[$tag]    🆕 首次运行（本地为空），从远端拉取文件"
+            local pre_sync_cmd=("$RCLONE" "sync" "$current_remote" "$LOCAL_PATH")
+        fi
+
+        # 复用过滤规则和代理
+        if [[ -f "$FILTERS_FILE" ]]; then
+            pre_sync_cmd+=(--filter-from "$FILTERS_FILE")
+        fi
+        if [[ -n "$dynamic_excludes" ]]; then
+            while IFS= read -r filter; do
+                [[ -n "$filter" ]] || continue
+                pre_sync_cmd+=(--filter "$filter")
+            done <<< "$dynamic_excludes"
+        fi
+        if [[ -n "$SOCKS5_PROXY" ]]; then
+            pre_sync_cmd+=(--http-proxy "$SOCKS5_PROXY")
+        fi
+        pre_sync_cmd+=(--local-no-check-updated --verbose)
+
+        log "[$tag] 📦 预同步命令: ${pre_sync_cmd[*]}"
+        local pre_sync_exit=0
+        "${pre_sync_cmd[@]}" >> "$LOG_FILE" 2>&1 || pre_sync_exit=$?
+
+        if [[ $pre_sync_exit -ne 0 ]]; then
+            log "[$tag] ❌ 预同步失败 (退出码: $pre_sync_exit)"
+        else
+            log "[$tag] ✅ 预同步完成"
+        fi
+
+        cmd+=(--resync)
     fi
 
     # rclone bisync 锁文件处理
@@ -334,7 +424,8 @@ do_sync() {
     mkdir -p "$rclone_cachedir"
 
     # 只清理当前 remote 的锁文件（超过 5 分钟视为残留）
-    find "$rclone_cachedir" -name "*${tag}*.lck" -mmin +5 -exec rm -f {} \; 2>/dev/null
+    # 使用 ..${tag}_ 精确匹配，避免 macOS 大小写不敏感误匹配
+    find "$rclone_cachedir" -name "*..${tag}_*.lck" -mmin +5 -exec rm -f {} \; 2>/dev/null
 
     if $FORCE; then
         cmd+=(--force)
@@ -372,7 +463,7 @@ do_sync() {
         errors=$(echo "$output" | grep "Errors:" | head -1 | grep -oE '[0-9]+' | head -1 || echo "0")
     fi
 
-    # 检查是否为已完成同步后的无害错误
+    # 检查是否为无害错误（如锁定文件无法删除）
     if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "100%"; then
         # 情况1: rclone bisync 完成后无法删除自己的 .lck 文件（竞争条件）
         # 这种错误不会损坏 bisync 状态，真正无害，直接忽略
@@ -381,19 +472,41 @@ do_sync() {
             log "[$tag] ⚠️  忽略无害的锁文件清理错误（同步已完成）"
             exit_code=0
         fi
+    fi
 
-        # 情况2: OneDrive 409 eTag 竞争导致 bisync 状态损坏
-        # 所有文件已传输完毕，但 rclone 已将 bisync 标记为 aborted
-        # 需要自动执行 --resync 恢复 bisync 状态，否则下次正常同步会拒绝运行
-        if echo "$output" | grep -q "Must run --resync to recover"; then
-            log "[$tag] ⚠️  检测到 bisync 状态损坏（可能由 OneDrive eTag 竞争引起）"
-            log "[$tag] 🔄 自动执行 --resync 恢复 bisync 状态..."
+    # 情况2: bisync 状态损坏 (由于文件正在写入或 eTag 竞争)
+    # 不依赖 100% 进度，因为传输随时可能中止
+    # 需要自动执行 --resync 恢复 bisync 状态，否则下次正常同步会拒绝运行
+    if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "Must run --resync to recover"; then
+        log "[$tag] ⚠️  检测到 bisync 状态损坏（可能由文件锁定或竞争引起）"
+        log "[$tag] 🔄 先将本地状态同步到远端，再重建 bisync 状态..."
 
-            # 构建 resync 命令（复用当前参数，去掉 verbose 减少输出）
+        # 步骤1: 单向 sync 本地 → 远端（传播本地删除）
+        local pre_sync_cmd=("$RCLONE" "sync" "$LOCAL_PATH" "$current_remote"
+            --local-no-check-updated)
+        if [[ -f "$FILTERS_FILE" ]]; then
+            pre_sync_cmd+=(--filter-from "$FILTERS_FILE")
+        fi
+        if [[ -n "$dynamic_excludes" ]]; then
+            while IFS= read -r filter; do
+                [[ -n "$filter" ]] || continue
+                pre_sync_cmd+=(--filter "$filter")
+            done <<< "$dynamic_excludes"
+        fi
+        if [[ -n "$SOCKS5_PROXY" ]]; then
+            pre_sync_cmd+=(--http-proxy "$SOCKS5_PROXY")
+        fi
+
+        log "[$tag] 📦 预同步命令: ${pre_sync_cmd[*]}"
+        local pre_sync_exit=0
+        "${pre_sync_cmd[@]}" >> "$LOG_FILE" 2>&1 || pre_sync_exit=$?
+
+        if [[ $pre_sync_exit -ne 0 ]]; then
+            log "[$tag] ❌ 预同步失败 (退出码: $pre_sync_exit)，跳过自动恢复"
+        else
+            # 步骤2: bisync --resync 建立追踪状态
             local resync_cmd=("$RCLONE" "bisync" "$LOCAL_PATH" "$current_remote"
-                --resync --resync-mode newer --resilient)
-
-            # 保留过滤规则
+                --resync --resilient --local-no-check-updated)
             if [[ -f "$FILTERS_FILE" ]]; then
                 resync_cmd+=(--filters-file "$FILTERS_FILE")
             fi
@@ -403,8 +516,6 @@ do_sync() {
                     resync_cmd+=(--filter "$filter")
                 done <<< "$dynamic_excludes"
             fi
-
-            # 保留代理
             if [[ -n "$SOCKS5_PROXY" ]]; then
                 resync_cmd+=(--http-proxy "$SOCKS5_PROXY")
             fi
@@ -418,7 +529,6 @@ do_sync() {
                 exit_code=0
             else
                 log "[$tag] ❌ bisync 状态恢复失败 (退出码: $resync_exit)"
-                # exit_code 保持原始错误码
             fi
         fi
     fi
@@ -468,6 +578,12 @@ do_sync() {
         log ""
         log "[$tag] ✅ 同步完成"
         write_status "success" "同步完成" "$transferred" "$errors"
+
+        # 记录此 remote 已成功初始化
+        if [[ ! -f "$INIT_STATE_FILE" ]]; then
+            date -u +%Y-%m-%dT%H:%M:%SZ > "$INIT_STATE_FILE"
+            log "[$tag] 📝 已记录初始化状态"
+        fi
 
         if ! $DRY_RUN && [[ "$CONFLICT_SILENT" != "true" ]] && [[ $transferred -gt 0 ]]; then
             notify "Cloud Sync" "✅ $tag 同步完成，${transferred} 个文件已处理"

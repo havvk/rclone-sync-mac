@@ -40,3 +40,6 @@
 - *.nosync
 - **.nosync/**
 - .venv-gemini/**
+
+# ---- 临时日志 ----
+- *.master.log
