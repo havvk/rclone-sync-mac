@@ -34,7 +34,7 @@ echo "🔨 编译菜单栏应用..."
 BUILD_DIR="$SCRIPT_DIR/StatusBarApp/build"
 mkdir -p "$BUILD_DIR"
 
-SWIFT_SRC="$SCRIPT_DIR/StatusBarApp/AIIA-RcloneSyncApp.swift"
+SWIFT_SRC="$SCRIPT_DIR/StatusBarApp/AIIARcloneSyncApp.swift"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
